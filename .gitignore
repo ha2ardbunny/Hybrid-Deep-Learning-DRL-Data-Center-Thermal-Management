@@ -5,3 +5,23 @@ __pycache__/
 .ipynb_checkpoints/
 *.png
 *.h5
+
+# 模型文件
+*.keras
+
+# Scaler 和配置
+*.pkl
+
+# 训练结果数据
+*.npy
+*.json
+
+# 数据集（通常很大，不放 GitHub）
+*.csv
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
