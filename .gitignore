@@ -1,27 +1,47 @@
+# ── Virtual Environment ──────────────────────────────
 venv/
 .venv/
+env/
+
+# ── Python ───────────────────────────────────────────
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# ── Jupyter ───────────────────────────────────────────
 .ipynb_checkpoints/
+model_architecture.png
 *.png
-*.h5
 
-# 模型文件
+# ── Trained Model Files ───────────────────────────────
 *.keras
+*.h5
+*.pt
+*.pth
 
-# Scaler 和配置
+# ── Scalers & Config (generated, not source) ──────────
 *.pkl
 
-# 训练结果数据
+# ── NumPy / Training Artifacts ────────────────────────
 *.npy
 *.json
 
-# 数据集（通常很大，不放 GitHub）
+# ── Dataset (too large for GitHub) ────────────────────
 *.csv
+data/
 
-# 系统文件
+# ── OS Files ──────────────────────────────────────────
 .DS_Store
 Thumbs.db
+*~
+*.swp
 
-# VS Code
+# ── IDE ───────────────────────────────────────────────
 .vscode/
+.idea/
+
+# ── Logs ──────────────────────────────────────────────
+*.log
+logs/
+runs/
