@@ -1,29 +1,3 @@
-"""
-HVAC Energy Optimization using CNN-LSTM + DDPG
-================================================
-References:
-- DDPG Algorithm: Lillicrap et al. (2015) "Continuous control with deep reinforcement learning"
-- DDPG Structure: XinJingHao/DDPG-Pytorch (clean actor/critic/replay/OUNoise pattern)
-- HVAC Control concept: Li et al. (2019) "Cooling Control Algorithm using DDPG"
-- CNN-LSTM Prediction: Gebreyesus et al. (2024) "Hybrid CNN-LSTM for DC energy"
-- Offline RL training: Yi et al. (2020) "DQN-LSTM for data centre job allocation"
-
-Architecture:
-  CNN-LSTM → predicts T_Return (room temperature, 2 hours ahead)
-             trained on historical HVAC sensor data, applied in batch mode
-  DDPG     → outputs T_Supply setpoint (supply air temperature target, degC)
-             to maintain T_Return near comfort target (20.0 degC)
-
-Action Space (Option A — T_Supply as Action):
-  The agent outputs an absolute T_Supply setpoint at each step.
-  Actor output in [-1, 1] is linearly scaled to [t_supply_min, t_supply_max].
-
-Simulated Environment:
-  XGBoost thermal model (R2=0.82) predicts T_Return given agent's T_Supply.
-  T_Supply feature importance = 79.6% — agent has true causal control.
-  Physics-based power formula replaces dataset Power (ON/OFF switch, 51% zeros).
-  Reward = pure thermal comfort control (PUE removed, Power not optimizable).
-"""
 import math
 import numpy as np
 import pandas as pd
@@ -36,7 +10,6 @@ from tqdm import tqdm
 from keras.models import load_model, Model
 from keras.layers import Dense, Input, Concatenate
 from keras.optimizers import Adam
-# XGBoost removed: replaced by calibrated first-order thermal lag model
 
 # ─── Load CNN-LSTM Model & Scalers ───────────────────────────────────────────
 
@@ -57,27 +30,27 @@ print(f"CNN-LSTM loaded | Features: {FEATURE_COLS} | Lookback: {n_input} steps")
 
 # ─── Load and Prepare Dataset ────────────────────────────────────────────────
 
-FILE_PATH = r'C:\Users\xin37\github\CNN-LSTM-model-for-energy-usage-forecasting-1\data\HVAC_NE_EC_19-21.csv'
+FILE_PATH = r'/mnt/c/Users/xin37/github/CNN-LSTM-model-for-energy-usage-forecasting-1/data/TDC2_processed.csv'
 
 print("Loading dataset...")
 df = pd.read_csv(FILE_PATH, parse_dates=['Timestamp'], index_col='Timestamp')
 df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
 
 df_model = df.copy()
-df_model['T_Supply_diff']  = df_model['T_Supply'].diff()
-df_model['T_Return_diff']  = df_model['T_Return'].diff()
-df_model['SP_Return_diff'] = df_model['SP_Return'].diff()
-df_model['Power_diff']     = df_model['Power'].diff()
+df_model['T_Supply_diff']   = df_model['T_Supply'].diff()
+df_model['T_Return_diff']   = df_model['T_Return'].diff()
+df_model['HVAC_Power_diff'] = df_model['HVAC_Power_kW'].diff()
+df_model['IT_Power_diff']   = df_model['IT_Power_Total_kW'].diff()
 df_model.dropna(inplace=True)
 
 print(f"Dataset loaded: {df_model.shape}")
 print(f"Date range: {df_model.index[0]} to {df_model.index[-1]}")
 print(f"T_Return mean: {df_model['T_Return'].mean():.2f}degC")
 print(f"T_Supply range: {df_model['T_Supply'].min():.2f} - {df_model['T_Supply'].max():.2f}degC")
+print(f"HVAC_Power_kW mean: {df_model['HVAC_Power_kW'].mean():.3f} kW")
+print(f"IT_Power_Total_kW mean: {df_model['IT_Power_Total_kW'].mean():.3f} kW")
+print(f"PUE mean: {df_model['PUE'].mean():.3f}")
 
-# Thermal model: calibrated first-order lag (no XGBoost needed)
-# alpha=0.96, equilibrium from dataset grouped statistics
-# T_Supply -> T_Return causal relationship validated
 print("\nThermal model: first-order lag (alpha=0.96, calibrated from dataset)")
 print("  T_Supply -> T_Return equilibrium from grouped statistics")
 print("  No ML fitting required — physics-based model")
@@ -115,31 +88,13 @@ print(f"Prediction range: {all_predictions.min():.2f} - {all_predictions.max():.
 # ─── HVAC Environment ────────────────────────────────────────────────────────
 
 class HVACEnv:
-    """
-    Simulated HVAC environment using XGBoost thermal model.
-
-    Key changes from original:
-    - T_Return fully determined by XGBoost thermal model (not dataset lookup)
-    - Agent's T_Supply action has TRUE causal effect on T_Return
-    - Physics-based power estimate replaces ON/OFF dataset Power
-    - Reward = pure comfort control (PUE removed, Power unoptimizable)
-
-    State (8 features):
-        [predicted_T_return, T_outdoor, T_Supply, est_power,
-         RH_outdoor, RH_return, T_saturation, comfort_error]
-
-    Action: T_Supply setpoint (degC), actor [-1,1] -> [t_supply_min, t_supply_max]
-
-    Reward: -(comfort_error / 5.0) - thermal_penalty
-    """
-
-    SAFETY_THRESHOLD = 25.0
-    ASSUMED_IT_POWER = 10.0
+    SAFETY_THRESHOLD = 35.0 
+    ASSUMED_IT_POWER = 14.125 
 
     def __init__(self, df, feature_cols,
-                 t_target=20.0,
-                 t_supply_min=15.51,     # dataset 5th percentile
-                 t_supply_max=27.14,     # dataset 95th percentile
+                 t_target=27.0,         
+                 t_supply_min=18.28,    
+                 t_supply_max=30.31,    
                  thermal_penalty_weight=1.0,
                  episode_len=200):
 
@@ -157,22 +112,23 @@ class HVACEnv:
 
         self.current_idx      = None
         self.current_t_supply = None
-        self.current_t_return = None   # [CHANGE D] simulated T_Return
-        self.episode_powers   = []     # [CHANGE D] physics power log
+        self.current_t_return = None   
+        self.episode_powers   = []   
         self.episode_pues     = []
         self.step_count       = 0
+        self.prev_pue = None
 
     def _predict_temperature(self, idx):
         return float(all_predictions[idx])
 
-    # [CHANGE E] Physics-based power estimation
-    # Replaces dataset Power (51% zeros, ON/OFF switch).
     # Physical reasoning: more cooling demand = more compressor work = more power.
-    def _estimate_power(self, t_supply, t_return, t_outdoor):
-        cooling_demand  = max(0.0, t_return - t_supply)
-        outdoor_penalty = max(0.0, t_outdoor - 20.0)
-        power = 0.5 + cooling_demand * 0.25 + outdoor_penalty * 0.08
-        return float(np.clip(power, 0.0, 6.0))
+    def _estimate_power(self, t_supply, t_outdoor):
+        it_power = self.ASSUMED_IT_POWER 
+        
+        cop = max(0.5, 3.0 - 0.1 * (t_outdoor - t_supply))
+        hvac_power = it_power / cop
+        
+        return float(np.clip(hvac_power, 2.0, 30.0))
 
     def _simulate_t_return(self, t_supply, prev_t_return):
         """
@@ -191,35 +147,33 @@ class HVACEnv:
 
         To reach T_Return=20degC, agent should target T_Supply~17-18degC.
         """
-        # Equilibrium lookup: from dataset grouped means (T_Supply bin -> T_Return mean)
-        _supply_bins  = [13.0, 15.0, 16.0, 17.0, 18.0, 19.0, 21.0, 23.0, 25.0, 27.0, 29.0]
-        _return_eq    = [18.50, 18.26, 18.70, 19.20, 20.00, 20.87, 21.22, 21.90, 21.81, 22.97, 22.79]
+        _supply_bins  = [14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 34.0]
+        _return_eq    = [22.0, 23.5, 25.0, 26.5, 27.5, 28.5, 29.5, 30.5, 31.5, 32.5, 33.5]
 
         t_return_eq   = float(np.interp(t_supply, _supply_bins, _return_eq))
         alpha         = 0.96
         noise         = np.random.normal(0, 0.15)
         t_return_next = alpha * prev_t_return + (1.0 - alpha) * t_return_eq + noise
-        return float(np.clip(t_return_next, 15.0, 30.0))
+        return float(np.clip(t_return_next, 15.0, 45.0))  
 
     def _build_state(self, predicted_t, idx):
-        t_outdoor    = float(self.df['T_Outdoor'].iloc[idx])
-        rh_outdoor   = float(self.df['RH_Outdoor'].iloc[idx])
-        rh_return    = float(self.df['RH_Return'].iloc[idx])
-        t_saturation = float(self.df['T_Saturation'].iloc[idx])
-        # [CHANGE F] Physics power in state, not dataset Power
-        sim_t = self.current_t_return if self.current_t_return is not None \
-                else predicted_t
-        est_power     = self._estimate_power(self.current_t_supply, sim_t, t_outdoor)
-        comfort_error = float(sim_t - self.t_target)
+        t_outdoor     = float(self.df['T_Outdoor'].iloc[idx])
+        rh_outdoor    = float(self.df['RH_Outdoor'].iloc[idx])
+        rh_return     = float(self.df['RH_Return'].iloc[idx])
+        hvac_power = self._estimate_power(self.current_t_supply, t_outdoor)
+        it_power      = float(self.df['IT_Power_Total_kW'].iloc[idx])
+        sim_t_return  = self.current_t_return if self.current_t_return is not None \
+                        else predicted_t
+        comfort_error = float(sim_t_return - self.t_target)
 
         return np.array([
             predicted_t,
             t_outdoor,
             self.current_t_supply,
-            est_power,             # [CHANGE F] physics power
+            hvac_power,            
             rh_outdoor,
             rh_return,
-            t_saturation,
+            it_power,             
             comfort_error
         ], dtype=np.float32)
 
@@ -227,10 +181,11 @@ class HVACEnv:
         max_start             = len(self.df) - self.episode_len - 1
         self.current_idx      = random.randint(n_input, max_start)
         self.current_t_supply = float(self.df['T_Supply'].iloc[self.current_idx])
-        self.current_t_return = float(self.df['T_Return'].iloc[self.current_idx])  # [CHANGE G]
+        self.current_t_return = float(self.df['T_Return'].iloc[self.current_idx]) 
         self.episode_powers   = []
         self.episode_pues     = []
         self.step_count       = 0
+        self.prev_pue = None
 
         predicted_t = self._predict_temperature(self.current_idx)
         return self._build_state(predicted_t, self.current_idx)
@@ -254,31 +209,36 @@ class HVACEnv:
         # 3. CNN-LSTM prediction (state observation)
         predicted_t = self._predict_temperature(self.current_idx)
 
-        # 4. First-order thermal lag model (replaces XGBoost)
-        #    XGBoost learned confounded correlations (not physical causality).
-        #    This model uses calibrated equilibrium lookup + thermal inertia.
-        #    T_Supply -> T_Return causal relationship validated from dataset.
-        t_outdoor_now  = float(self.df['T_Outdoor'].iloc[self.current_idx])
+        # 4. First-order thermal lag model 
         actual_t              = self._simulate_t_return(
             self.current_t_supply, self.current_t_return
         )
-        self.current_t_return = actual_t   # update simulated state
+        self.current_t_return = actual_t 
 
-        # 5. Physics power + PUE (for logging only, not in reward)
-        est_power = self._estimate_power(self.current_t_supply, actual_t, t_outdoor_now)
+        # 5. Real HVAC power and PUE from TDC2 dataset
+        est_power = self._estimate_power(self.current_t_supply, 
+                                  float(self.df['T_Outdoor'].iloc[self.current_idx]))
+        it_power  = float(self.df['IT_Power_Total_kW'].iloc[self.current_idx])
         self.episode_powers.append(est_power)
         pue = float(np.clip(
-            (self.ASSUMED_IT_POWER + est_power) / self.ASSUMED_IT_POWER, 1.0, 3.0
+            (it_power + est_power) / max(it_power, 0.1), 1.0, 3.0
         ))
         self.episode_pues.append(pue)
 
-        # 6. [CHANGE H] Reward = pure comfort control
-        #    PUE removed: dataset Power is ON/OFF, not optimizable
-        #    comfort_error normalized by 5.0 for stable gradients
+        # 6. Reward = comfort + energy
         comfort_error   = abs(actual_t - self.t_target)
         temp_diff       = np.clip(actual_t - self.SAFETY_THRESHOLD, -50, 50)
-        thermal_penalty = self.thermal_penalty_weight * math.log1p(math.exp(temp_diff))
-        reward          = -(comfort_error / 5.0) - thermal_penalty
+        k = 0.5
+        thermal_penalty = self.thermal_penalty_weight * math.log1p(math.exp(k * temp_diff))
+
+        pue_penalty     = (pue - 1.0)           
+        comfort_penalty = 0.1 * comfort_error
+        delta_bonus     = 0.0 if self.prev_pue is None else 0.3 * (self.prev_pue - pue)
+
+        reward = -pue_penalty - comfort_penalty - thermal_penalty + delta_bonus
+        reward = max(reward, -10.0)
+
+        self.prev_pue = pue   
 
         # 7. Next state
         next_state = self._build_state(predicted_t, self.current_idx)
@@ -287,7 +247,7 @@ class HVACEnv:
             'predicted_T_return': predicted_t,
             'actual_T_return':    actual_t,
             'T_Supply':           self.current_t_supply,
-            'est_power':          est_power,
+            'HVAC_Power_kW':      est_power,
             'PUE':                pue,
             'comfort_error':      comfort_error,
             'thermal_penalty':    thermal_penalty,
@@ -373,8 +333,8 @@ class DDPGAgent:
                  lr_actor=1e-4,
                  lr_critic=1e-3,
                  buffer_size=100000,
-                 batch_size=128,      # increased from 64
-                 warmup=2000):        # increased from 500
+                 batch_size=128,      
+                 warmup=2000):     
 
         self.action_range = action_range
         self.gamma        = gamma
@@ -409,17 +369,22 @@ class DDPGAgent:
     def learn(self):
         if len(self.memory) < self.batch_size:
             return
+        self._learn_step()
 
+    @tf.function
+    def _learn_step(self):
         s, a, r, ns, d = self.memory.sample(self.batch_size)
         s_t  = tf.convert_to_tensor(s,  dtype=tf.float32)
         a_t  = tf.convert_to_tensor(a,  dtype=tf.float32)
         ns_t = tf.convert_to_tensor(ns, dtype=tf.float32)
+        r_t  = tf.convert_to_tensor(r,  dtype=tf.float32)
+        d_t  = tf.convert_to_tensor(d,  dtype=tf.float32)
 
         with tf.GradientTape() as tape:
-            next_a      = self.target_actor(ns_t,  training=False)
-            target_q    = self.target_critic([ns_t, next_a], training=False)
-            y           = r[:, None] + self.gamma * target_q * (1 - d[:, None])
-            q           = self.critic([s_t, a_t], training=True)
+            next_a   = self.target_actor(ns_t, training=False)
+            target_q = self.target_critic([ns_t, next_a], training=False)
+            y        = r_t[:, None] + self.gamma * target_q * (1 - d_t[:, None])
+            q        = self.critic([s_t, a_t], training=True)
             critic_loss = tf.reduce_mean(tf.square(y - q))
         grads = tape.gradient(critic_loss, self.critic.trainable_variables)
         self.critic_opt.apply_gradients(zip(grads, self.critic.trainable_variables))
@@ -465,10 +430,10 @@ def train(df_model, total_steps=200000):
     print(f"Environment:    First-order thermal lag (alpha=0.96, calibrated)")
     print(f"State dim:      {env.state_dim} features")
     print(f"Action:         T_Supply setpoint (degC)")
-    print(f"T_Return target:{env.t_target}degC")
-    print(f"Safety limit:   {env.SAFETY_THRESHOLD}degC")
-    print(f"T_Supply range: {env.t_supply_min} - {env.t_supply_max}degC")
-    print(f"Reward:         -(comfort_error/5) - thermal_penalty  [NO PUE]")
+    print(f"T_Return target:{env.t_target}degC  (TDC2: mean=29.1degC)")
+    print(f"Safety limit:   {env.SAFETY_THRESHOLD}degC  (TDC2: max=43.5degC)")
+    print(f"T_Supply range: {env.t_supply_min} - {env.t_supply_max}degC  (TDC2 5th-95th pct)")
+    print(f"Reward:         -(comfort/8) - pue_penalty - thermal_penalty  [PUE ENABLED]")
     print(f"Thermal penalty:{env.thermal_penalty_weight}x log-barrier")
     print(f"Batch size:     {agent.batch_size}")
     print(f"Warmup steps:   {agent.warmup}")
@@ -517,7 +482,7 @@ def train(df_model, total_steps=200000):
             'err':   f'{info["comfort_error"]:.2f}',
             'T_sup': f'{info["T_Supply"]:.2f}',
             'T_ret': f'{info["actual_T_return"]:.2f}',
-            'pwr':   f'{info["est_power"]:.2f}'
+            'pue':   f'{info["PUE"]:.3f}'
         })
         pbar.update(1)
 
@@ -553,6 +518,36 @@ def train(df_model, total_steps=200000):
     print(f"Safety violations (T>{env.SAFETY_THRESHOLD}degC): {violation_count} steps")
     print(f"{'='*60}")
 
+    # ── Save training results ────────────────────────────────────────────────
+    import json
+    train_results = {
+        'total_steps':        total_steps,
+        'total_episodes':     episode,
+        'final_comfort_error':float(np.mean(error_history[-500:])),
+        'final_t_return':     float(np.mean(temp_history[-500:])),
+        'final_t_supply':     float(np.mean(sp_history[-500:])),
+        'final_pue':          float(np.mean(pue_history[-500:])),
+        'safety_violations':  violation_count,
+        't_target':           env.t_target,
+        'safety_threshold':   env.SAFETY_THRESHOLD,
+        'best_reward':        float(max(episode_rewards)),
+    }
+    with open('ddpg_train_results.json', 'w') as f:
+        json.dump(train_results, f, indent=2)
+
+    np.save('ddpg_train_rewards.npy',  np.array(episode_rewards))
+    np.save('ddpg_train_errors.npy',   np.array(error_history))
+    np.save('ddpg_train_temps.npy',    np.array(temp_history))
+    np.save('ddpg_train_supply.npy',   np.array(sp_history))
+    np.save('ddpg_train_pues.npy',     np.array(pue_history))
+    print("Training results saved:")
+    print("  ddpg_train_results.json")
+    print("  ddpg_train_rewards.npy")
+    print("  ddpg_train_errors.npy")
+    print("  ddpg_train_temps.npy")
+    print("  ddpg_train_supply.npy")
+    print("  ddpg_train_pues.npy")
+
     return agent, pue_history
 
 # ─── Plot Training ───────────────────────────────────────────────────────────
@@ -562,8 +557,7 @@ def _plot_training(episode_rewards, episode_pues,
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 11))
-    fig.suptitle('DDPG Training Results — CNN-LSTM + DDPG HVAC Control\n'
-                 '(Simulated Env: XGBoost Thermal Model)',
+    fig.suptitle('DDPG Training Results — CNN-LSTM + DDPG HVAC Control\n',
                  fontsize=13, fontweight='bold')
 
     def smooth(x, w=20):
@@ -599,7 +593,7 @@ def _plot_training(episode_rewards, episode_pues,
     axes[0,1].axhline(y=np.mean(error_history), color='orange', linestyle='-.',
                       linewidth=1.5,
                       label=f'Mean={np.mean(error_history):.3f}degC')
-    axes[0,1].set_title('Comfort Error = |T_Return - 20degC| (lower = better)')
+    axes[0,1].set_title(f'Comfort Error T_Return - {env.t_target} degC')
     axes[0,1].set_xlabel('Step')
     axes[0,1].set_ylabel('Error (degC)')
     axes[0,1].legend(fontsize=8)
@@ -646,7 +640,7 @@ def _plot_training(episode_rewards, episode_pues,
     axes[1,1].fill_between(np.arange(len(sm_t)), sm_t, env.t_target,
                             where=(np.array(sm_t) <= env.t_target),
                             alpha=0.15, color='blue', label='Below target')
-    axes[1,1].set_title('Simulated T_Return (XGBoost model)')
+    axes[1,1].set_title('Simulated T_Return (First-order Thermal Lag Model)')
     axes[1,1].set_xlabel('Step')
     axes[1,1].set_ylabel('Temperature (degC)')
     axes[1,1].legend(fontsize=8)
@@ -674,8 +668,7 @@ def test(df_model, num_episodes=5):
 
     all_pues, all_errors, all_rewards, all_violations = [], [], [], []
     fig, axes = plt.subplots(2, 2, figsize=(16, 11))
-    fig.suptitle('DDPG Test Results — CNN-LSTM + DDPG HVAC Control\n'
-                 '(Simulated Env: XGBoost Thermal Model)',
+    fig.suptitle('DDPG Test Results — CNN-LSTM + DDPG HVAC Control\n',
                  fontsize=13, fontweight='bold')
     colors = ['blue', 'green', 'red', 'orange', 'purple']
 
@@ -698,8 +691,8 @@ def test(df_model, num_episodes=5):
             if done:
                 break
 
-        ep_predictions = [all_predictions[env.current_idx - len(temps) + i]
-                          for i in range(len(temps))]
+        ep_predictions = [all_predictions[env.current_idx - len(temps) + i + 1]
+                        for i in range(len(temps))]
         due = calculate_due_validation(temps, ep_predictions)
 
         avg_pue   = np.mean(pues)
@@ -763,7 +756,7 @@ def test(df_model, num_episodes=5):
     axes[1,1].axhline(y=np.mean(all_errors), color='red', linestyle='-.',
                       linewidth=1.5,
                       label=f'Mean={np.mean(all_errors):.3f}degC')
-    axes[1,1].set_title('Comfort Error = |T_Return - 20degC|')
+    axes[1,1].set_title('Comfort Error = |T_Return - 27degC|')
     axes[1,1].set_xlabel('Step')
     axes[1,1].set_ylabel('Error (degC)')
     axes[1,1].legend(fontsize=8)
@@ -783,6 +776,40 @@ def test(df_model, num_episodes=5):
     print(f"  Safety Violations:     {sum(all_violations)}")
     print(f"  Target T_Return:       {env.t_target}degC")
     print(f"{'='*55}")
+
+    # ── Save test results ─────────────────────────────────────────────────────
+    import json
+    test_results = {
+        'num_episodes':       num_episodes,
+        'episode_len':        env.episode_len,
+        'mean_comfort_error': float(np.mean(all_errors)),
+        'std_comfort_error':  float(np.std(all_errors)),
+        'mean_pue':           float(np.mean(all_pues)),
+        'mean_reward':        float(np.mean(all_rewards)),
+        'safety_violations':  int(sum(all_violations)),
+        't_target':           env.t_target,
+        'per_episode': [
+            {
+                'episode':        ep + 1,
+                'comfort_error':  float(all_errors[ep]),
+                'pue':            float(all_pues[ep]),
+                'reward':         float(all_rewards[ep]),
+                'violations':     int(all_violations[ep]),
+            }
+            for ep in range(num_episodes)
+        ]
+    }
+    with open('ddpg_test_results.json', 'w') as f:
+        json.dump(test_results, f, indent=2)
+
+    np.save('ddpg_test_errors.npy',   np.array(all_errors))
+    np.save('ddpg_test_pues.npy',     np.array(all_pues))
+    np.save('ddpg_test_rewards.npy',  np.array(all_rewards))
+    print("\nTest results saved:")
+    print("  ddpg_test_results.json")
+    print("  ddpg_test_errors.npy")
+    print("  ddpg_test_pues.npy")
+    print("  ddpg_test_rewards.npy")
 
 # ─── DUE Metric ──────────────────────────────────────────────────────────────
 
