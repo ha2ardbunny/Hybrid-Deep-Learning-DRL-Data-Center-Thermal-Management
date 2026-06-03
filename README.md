@@ -1,8 +1,6 @@
 # Coupling Hybrid Deep Learning Prediction with DRL-Based Control for Energy-Efficient Data Center Thermal Management
 
-**Final Year Project (FYP) — Universiti Malaysia Sarawak (UNIMAS)**
-Faculty of Computer Science and Information Technology (FCSIT)
-Student ID: 84259 | Supervisor: Assoc. Prof. Dr. Chiew Kang Leng
+**Final Year Project (FYP)**
 
 ---
 
